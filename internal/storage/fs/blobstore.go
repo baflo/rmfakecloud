@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,8 +21,8 @@ import (
 	"github.com/ddvk/rmfakecloud/internal/storage/exporter"
 	"github.com/ddvk/rmfakecloud/internal/storage/models"
 	"github.com/google/uuid"
+	"github.com/joagonca/rmc-go/parser"
 	"github.com/juju/fslock"
-	"github.com/juruen/rmapi/archive"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -122,23 +123,29 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 
 			// Extract .rm files directly from blob storage without parsing
 			// First, get content.json to know page order
-			var contentData archive.Content
+			var pageIDs []string
+
 			for _, f := range doc.Files {
 				if filepath.Ext(f.EntryName) == storage.ContentFileExt {
 					blob, err := ls.GetReader(f.Hash)
 					if err == nil {
 						contentBytes, _ := io.ReadAll(blob)
 						blob.Close()
-						err = json.Unmarshal(contentBytes, &contentData)
+
+						// Parse content.json using rmc-go's parser
+						var contentFile parser.ContentFile
+						err = json.Unmarshal(contentBytes, &contentFile)
 						if err != nil {
 							log.Warnf("Failed to unmarshal content.json: %v", err)
+						} else {
+							// Use rmc-go's GetPageIDs() which handles sorting by idx
+							pageIDs = contentFile.GetPageIDs()
+							log.Debugf("Content has %d pages", len(pageIDs))
 						}
 					}
 					break
 				}
 			}
-
-			log.Debugf("Content has %d pages", len(contentData.Pages))
 
 			// Build map of page names to hashes
 			pageMap := make(map[string]string)
@@ -152,52 +159,71 @@ func (fs *FileSystemStorage) Export(uid, docid string) (r io.ReadCloser, err err
 
 			log.Debugf("Built page map with %d entries", len(pageMap))
 
-			// Extract first page (single page for now)
-			var firstPageHash string
-			if len(contentData.Pages) > 0 {
-				log.Debugf("Looking for page: %s", contentData.Pages[0])
-				if hash, ok := pageMap[contentData.Pages[0]]; ok {
-					firstPageHash = hash
-					log.Debugf("Found first page hash: %s", hash)
-				} else {
-					log.Warnf("Page %s not found in pageMap", contentData.Pages[0])
+			// Collect all pages in order from content.json
+			var pageHashes []string
+			if len(pageIDs) > 0 {
+				// Use ordered pages from content.json
+				pageHashes = make([]string, 0, len(pageIDs))
+				for i, pageName := range pageIDs {
+					if hash, ok := pageMap[pageName]; ok {
+						pageHashes = append(pageHashes, hash)
+						log.Debugf("Page %d: %s -> %s", i, pageName, hash)
+					} else {
+						log.Warnf("Page %s (index %d) not found in pageMap", pageName, i)
+					}
 				}
 			} else {
-				// No pages in content.json, try to use any .rm file we found
-				log.Warn("content.json has no pages array, trying first .rm file found")
-				for name, hash := range pageMap {
-					firstPageHash = hash
-					log.Infof("Using .rm file: %s -> %s", name, hash)
-					break
+				// No pages in content.json, export all .rm files found (sorted by name)
+				log.Warnf("content.json has no pages array, exporting all %d .rm files found (sorted)", len(pageMap))
+
+				// Sort page names for consistent ordering
+				pageNames := make([]string, 0, len(pageMap))
+				for name := range pageMap {
+					pageNames = append(pageNames, name)
+				}
+
+				// Sort page names for consistent ordering
+				sort.Strings(pageNames)
+
+				pageHashes = make([]string, 0, len(pageNames))
+				for i, name := range pageNames {
+					pageHashes = append(pageHashes, pageMap[name])
+					log.Infof("Page %d: %s -> %s", i, name, pageMap[name])
 				}
 			}
 
-			if firstPageHash == "" {
+			if len(pageHashes) == 0 {
 				log.Error("No pages found in v6 document")
 				log.Debugf("Doc files: %+v", doc.Files)
 				writer.CloseWithError(fmt.Errorf("no pages found"))
 				return
 			}
 
-			// Get raw .rm data
-			rmReader, err := ls.GetReader(firstPageHash)
-			if err != nil {
-				log.Errorf("Failed to get v6 page data: %v", err)
-				writer.CloseWithError(err)
-				return
-			}
-			defer rmReader.Close()
+			log.Infof("Exporting %d pages for v6 blob doc %s", len(pageHashes), docid)
 
-			// Read .rm data into memory
-			rmData, err := io.ReadAll(rmReader)
-			if err != nil {
-				log.Errorf("Failed to read .rm data: %v", err)
-				writer.CloseWithError(err)
-				return
+			// Load all page data
+			allPagesData := make([][]byte, len(pageHashes))
+			for i, hash := range pageHashes {
+				rmReader, err := ls.GetReader(hash)
+				if err != nil {
+					log.Errorf("Failed to get v6 page %d data: %v", i, err)
+					writer.CloseWithError(err)
+					return
+				}
+
+				rmData, err := io.ReadAll(rmReader)
+				rmReader.Close()
+				if err != nil {
+					log.Errorf("Failed to read .rm data for page %d: %v", i, err)
+					writer.CloseWithError(err)
+					return
+				}
+
+				allPagesData[i] = rmData
 			}
 
-			// Use rmc-go library (in-process, Cairo renderer)
-			err = exporter.ExportV6ToPdfNative(rmData, writer)
+			// Use rmc-go library with multi-page support
+			err = exporter.ExportV6MultiPageToPdfNative(allPagesData, writer)
 			if err != nil {
 				log.Errorf("Failed to export v6 with rmc-go: %v", err)
 				writer.CloseWithError(err)

@@ -118,23 +118,24 @@ func (fs *FileSystemStorage) ExportDocument(uid, id, outputType string, exportOp
 
 		// Use native rmc-go library (Cairo renderer)
 		if len(arch.V6PageData) > 0 {
-			// Get first page data (currently only single page supported)
-			var firstPageData []byte
-			if data, ok := arch.V6PageData[0]; ok {
-				firstPageData = data
-			} else {
-				// If page 0 doesn't exist, get the first available page
-				for _, data := range arch.V6PageData {
-					firstPageData = data
-					break
+			// Collect all pages in order
+			pages := make([][]byte, len(arch.V6PageData))
+			for pageIdx, pageData := range arch.V6PageData {
+				if pageIdx >= len(pages) {
+					return nil, fmt.Errorf("invalid page index %d for doc with %d pages", pageIdx, len(pages))
+				}
+				pages[pageIdx] = pageData
+			}
+
+			// Verify all pages are present
+			for i, pageData := range pages {
+				if pageData == nil {
+					return nil, fmt.Errorf("missing page %d in v6 document", i)
 				}
 			}
 
-			if firstPageData == nil {
-				return nil, fmt.Errorf("no v6 page data found in archive")
-			}
-
-			err = exporter.ExportV6ToPdfNative(firstPageData, outputFile)
+			log.Infof("Exporting %d pages for v6 doc %s", len(pages), sanitizedID)
+			err = exporter.ExportV6MultiPageToPdfNative(pages, outputFile)
 			if err != nil {
 				return nil, fmt.Errorf("v6 native export failed: %w", err)
 			}
